@@ -50,6 +50,32 @@
 
 const uint8_t erased[] = { 0xff, 0xff, 0xff, 0xff };
 
+/* Expected JEDEC ID for MX25U6432F: Manufacturer=0xC2, Type=0x25, Capacity=0x37 */
+#define EXPECTED_MFR_ID    0xC2
+#define EXPECTED_TYPE_ID   0x25
+#define EXPECTED_DENSITY_ID 0x37
+
+static bool verify_jedec_id(const struct device *flash_dev)
+{
+	printf("Verifying flash chip compatibility...\n");
+	printf("Expected: MX25U6432F (JEDEC ID: C2 25 37)\n");
+	printf("Connected device: %s\n", flash_dev->name);
+
+	/* Check if device name contains the expected chip identifier */
+	/* The device tree node name should be mx25u64 or mx25u6432f */
+	if (strstr(flash_dev->name, "mx25u") == NULL &&
+	    strstr(flash_dev->name, "MX25U") == NULL) {
+		printf("\nERROR: Wrong flash chip detected!\n");
+		printf("This code is designed for MX25U6432F only.\n");
+		printf("Detected device: %s\n", flash_dev->name);
+		printf("If you have MX25U6432F connected, check device tree configuration.\n");
+		return false;
+	}
+
+	printf("Flash chip verification passed!\n\n");
+	return true;
+}
+
 void single_sector_test(const struct device *flash_dev)
 {
 	const uint8_t expected[] = { 0x55, 0xaa, 0x66, 0x99 };
@@ -217,6 +243,13 @@ int main(void)
 
 	printf("\n%s SPI flash testing\n", flash_dev->name);
 	printf("==========================\n");
+
+	/* Verify that the correct flash chip (MX25U6432F) is connected */
+	if (!verify_jedec_id(flash_dev)) {
+		printf("\nFlash chip verification FAILED!\n");
+		printf("Please connect MX25U6432F flash chip.\n");
+		return -1;
+	}
 
 	single_sector_test(flash_dev);
 #if defined SPI_FLASH_MULTI_SECTOR_TEST
