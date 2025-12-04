@@ -55,6 +55,55 @@ const uint8_t erased[] = { 0xff, 0xff, 0xff, 0xff };
 #define EXPECTED_TYPE_ID   0x25
 #define EXPECTED_DENSITY_ID 0x37
 
+/* Quick erase test at a specific offset */
+static bool test_erase_at_offset(const struct device *flash_dev, off_t offset)
+{
+	uint8_t buf[16];  /* Read more bytes to see pattern */
+	int rc;
+
+	printf("  Testing erase at offset 0x%x...\n", (unsigned int)offset);
+
+	/* Read before erase to see what's there */
+	memset(buf, 0, sizeof(buf));
+	rc = flash_read(flash_dev, offset, buf, sizeof(buf));
+	if (rc == 0) {
+		printf("    Before: %02x %02x %02x %02x %02x %02x %02x %02x...\n",
+		       buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+	}
+
+	/* Erase sector */
+	rc = flash_erase(flash_dev, offset, SPI_FLASH_SECTOR_SIZE);
+	if (rc != 0) {
+		printf("    Erase command failed! %d\n", rc);
+		return false;
+	}
+
+	/* MX25U6432F sector erase takes up to 600ms according to datasheet
+	 * Use 2000ms to work around nRF MSPI driver bug where it doesn't
+	 * wait for erase completion (Zephyr issue #71442)
+	 */
+	k_msleep(2000);
+
+	/* Verify erase - read more bytes to see the pattern */
+	memset(buf, 0, sizeof(buf));
+	rc = flash_read(flash_dev, offset, buf, sizeof(buf));
+	if (rc != 0) {
+		printf("    Read failed! %d\n", rc);
+		return false;
+	}
+
+	printf("    After:  %02x %02x %02x %02x %02x %02x %02x %02x...\n",
+	       buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+
+	if (memcmp(erased, buf, 4) == 0) {
+		printf("    OK\n");
+		return true;
+	} else {
+		printf("    FAIL (expected ff ff ff ff...)\n");
+		return false;
+	}
+}
+
 static bool verify_jedec_id(const struct device *flash_dev)
 {
 	printf("Verifying flash chip compatibility...\n");
@@ -91,6 +140,14 @@ void single_sector_test(const struct device *flash_dev)
 	 */
 	printf("\nTest 1: Flash erase\n");
 
+	/* Read current content before erase */
+	memset(buf, 0, len);
+	rc = flash_read(flash_dev, SPI_FLASH_TEST_REGION_OFFSET, buf, len);
+	if (rc == 0) {
+		printf("Before erase: 0x%02x 0x%02x 0x%02x 0x%02x\n",
+		       buf[0], buf[1], buf[2], buf[3]);
+	}
+
 	/* Full flash erase if SPI_FLASH_TEST_REGION_OFFSET = 0 and
 	 * SPI_FLASH_SECTOR_SIZE = flash size
 	 */
@@ -99,6 +156,15 @@ void single_sector_test(const struct device *flash_dev)
 	if (rc != 0) {
 		printf("Flash erase failed! %d\n", rc);
 	} else {
+		printf("Flash erase command completed (rc=%d)\n", rc);
+
+		/* Workaround for nRF MSPI driver bug (Zephyr issue #71442)
+		 * Driver doesn't wait for erase completion, so we manually wait
+		 * MX25U6432F sector erase takes up to 600ms per datasheet
+		 */
+		printf("Waiting for erase to complete (2s delay for driver bug)...\n");
+		k_msleep(2000);
+
 		/* Check erased pattern */
 		memset(buf, 0, len);
 		rc = flash_read(flash_dev, SPI_FLASH_TEST_REGION_OFFSET, buf, len);
@@ -106,12 +172,46 @@ void single_sector_test(const struct device *flash_dev)
 			printf("Flash read failed! %d\n", rc);
 			return;
 		}
+		printf("After erase:  0x%02x 0x%02x 0x%02x 0x%02x\n",
+		       buf[0], buf[1], buf[2], buf[3]);
+
 		if (memcmp(erased, buf, len) != 0) {
-			printf("Flash erase failed at offset 0x%x got 0x%x\n",
+			printf("Flash erase failed at offset 0x%x got 0x%08x (expected 0xffffffff)\n",
 				SPI_FLASH_TEST_REGION_OFFSET, *(uint32_t *)buf);
-			return;
+			printf("Byte-by-byte comparison:\n");
+			for (size_t i = 0; i < len; i++) {
+				printf("  Byte %zu: expected 0xff, got 0x%02x %s\n",
+				       i, buf[i], (buf[i] == 0xff) ? "OK" : "FAIL");
+			}
+
+			/* Try erasing again to see if double-erase helps */
+			printf("\nRetrying erase operation...\n");
+			rc = flash_erase(flash_dev, SPI_FLASH_TEST_REGION_OFFSET,
+					 SPI_FLASH_SECTOR_SIZE);
+			if (rc != 0) {
+				printf("Second erase failed! %d\n", rc);
+				return;
+			}
+			k_msleep(2000);
+
+			memset(buf, 0, len);
+			rc = flash_read(flash_dev, SPI_FLASH_TEST_REGION_OFFSET, buf, len);
+			if (rc != 0) {
+				printf("Flash read after second erase failed! %d\n", rc);
+				return;
+			}
+			printf("After 2nd erase: 0x%02x 0x%02x 0x%02x 0x%02x\n",
+			       buf[0], buf[1], buf[2], buf[3]);
+
+			if (memcmp(erased, buf, len) != 0) {
+				printf("Still failed after second erase.\n");
+				printf("This may indicate a hardware issue or driver bug.\n");
+				return;
+			}
+			printf("Second erase succeeded!\n");
+		} else {
+			printf("Flash erase succeeded!\n");
 		}
-		printf("Flash erase succeeded!\n");
 	}
 	printf("\nTest 2: Flash write\n");
 
@@ -250,6 +350,15 @@ int main(void)
 		printf("Please connect MX25U6432F flash chip.\n");
 		return -1;
 	}
+
+	/* Test erase at multiple offsets to identify if issue is location-specific */
+	printf("\nTesting erase at multiple offsets:\n");
+	printf("==================================\n");
+	test_erase_at_offset(flash_dev, 0x0);
+	test_erase_at_offset(flash_dev, 0x1000);
+	test_erase_at_offset(flash_dev, 0x10000);
+	test_erase_at_offset(flash_dev, 0x50000);
+	test_erase_at_offset(flash_dev, 0xff000);
 
 	single_sector_test(flash_dev);
 #if defined SPI_FLASH_MULTI_SECTOR_TEST
